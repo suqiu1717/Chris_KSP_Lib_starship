@@ -19,6 +19,13 @@ FUNCTION f9_launch {
         f9_print_result("ERROR: liftoff engines have no thrust").
         RETURN FALSE.
     }
+    IF f9_engine_mode_enabled(params) {
+        // f9_engine_mode_begin reports the reason itself, including the action
+        // names this install does expose.
+        IF NOT f9_engine_mode_begin(params) {
+            RETURN FALSE.
+        }
+    }
 
     f9_print_at(2, "State: starting main engines").
     f9_print_at(
@@ -81,6 +88,7 @@ FUNCTION f9_launch {
     f9_print_at(2, "State: programmed turn").
     f9_print_at(10, "Event: turn started").
     LOCAL turnStart IS TIME:SECONDS.
+    LOCAL modePreset IS FALSE.
     UNTIL SHIP:MASS <= params["mecoMass"] {
         LOCAL pitchCommand IS MAX(
             0,
@@ -106,14 +114,57 @@ FUNCTION f9_launch {
             7,
             "Throttle: " + ROUND(SHIP:CONTROL:MAINTHROTTLE, 2)
         ).
+        // Engine-mode control: select the pre-separation group (Middle Two)
+        // once the stack is engineModePreSeparationMass tonnes above the MECO
+        // mass, so the switch happens under power instead of during the
+        // MECO-to-staging coast. The switch itself shuts the outer groups
+        // down, so the remaining margin burns at the Middle Two rate and MECO
+        // arrives a couple of seconds after the switch, not immediately (see
+        // the engineModePreSeparationMass note in the boot lexicon).
+        IF f9_engine_mode_enabled(params) AND NOT modePreset {
+            IF SHIP:MASS <= params["mecoMass"]
+                + params["engineModePreSeparationMass"] {
+                IF NOT f9_engine_mode_goto(
+                    params, params["engineModePreSeparation"]
+                ) {
+                    f9_print_result(
+                        "ERROR: engine-mode pre-separation switch failed"
+                    ).
+                    RETURN FALSE.
+                }
+                SET modePreset TO TRUE.
+                f9_print_at(
+                    8, "Engine mode: " + f9_engine_mode_name(params)
+                ).
+            }
+        }
         WAIT 0.
     }
 
     f9_print_at(2, "State: MECO").
     f9_print_at(10, "Event: main engine cutoff").
-    LOCK THROTTLE TO 0.
-    deactivate_engines(liftoffEngines).
-    f9_print_at(7, "Throttle command: 0.00").
+    // With engine-mode control (Starship) the first stage is not throttled down
+    // at MECO: the mode switch already shut the outer groups down, and the
+    // remaining group keeps burning through staging (hot staging). Every other
+    // profile keeps the original cutoff.
+    IF f9_engine_mode_enabled(params) {
+        f9_print_at(7, "Throttle command: 1.00").
+    } ELSE {
+        LOCK THROTTLE TO 0.
+        f9_engine_deactivate(params, liftoffEngines).
+        f9_print_at(7, "Throttle command: 0.00").
+    }
+
+    // Fallback: the ascent loop normally switched mode already. This covers a
+    // zero margin and a mass step large enough to skip the threshold.
+    IF f9_engine_mode_enabled(params) AND NOT modePreset {
+        IF NOT f9_engine_mode_goto(params, params["engineModePreSeparation"]) {
+            f9_print_result("ERROR: engine-mode pre-separation switch failed").
+            RETURN FALSE.
+        }
+        SET modePreset TO TRUE.
+        f9_print_at(8, "Engine mode: " + f9_engine_mode_name(params)).
+    }
     WAIT params["stageSeparationDelay"].
 
     f9_print_at(2, "State: stage separation").

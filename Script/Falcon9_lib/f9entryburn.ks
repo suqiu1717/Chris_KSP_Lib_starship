@@ -11,20 +11,36 @@ FUNCTION f9_entry_burn {
 
     f9_clear_guidance_display().
     pre_entryburn_hook().
+    // The phase coasts at zero throttle. A booster handed over from a
+    // hot-staging separation under engine-mode control can still be at the
+    // inherited throttle here, and the "powered burn disabled" path returns
+    // without any other throttle command, so lock the throttle down before the
+    // engine lookup and the LTR setup; the lock holds through the retrograde
+    // coast below.
+    LOCK THROTTLE TO 0.
     IF NOT params["enableEntryBurn"] {
         f9_print_at(11, "Phase: entry - powered burn disabled").
         f9_print_at(16, "Engines: skipped  Throttle: 0.00").
         RETURN TRUE.
     }
-    LOCAL entryEngines IS search_engine(params["entryEngineTag"]).
-    IF entryEngines:LENGTH = 0 {
-        f9_print_result("ERROR: no entry engines found").
-        RETURN FALSE.
-    }
-    LOCAL engineInfo IS get_engines_info(entryEngines).
-    IF engineInfo["thrust"] <= 0 {
-        f9_print_result("ERROR: entry engines have no thrust").
-        RETURN FALSE.
+    // Under engine-mode control the SEP switch owns the engine groups and the
+    // tag search cannot split the single cluster part; thrust data comes from
+    // the boot lexicon instead (see sepmodeprobe.ks).
+    LOCAL entryEngines IS LIST().
+    LOCAL engineInfo IS 0.
+    IF f9_engine_mode_enabled(params) {
+        SET engineInfo TO f9_engine_mode_engine_data(params, "engineModeDataPostSeparation").
+    } ELSE {
+        SET entryEngines TO search_engine(params["entryEngineTag"]).
+        IF entryEngines:LENGTH = 0 {
+            f9_print_result("ERROR: no entry engines found").
+            RETURN FALSE.
+        }
+        SET engineInfo TO get_engines_info(entryEngines).
+        IF engineInfo["thrust"] <= 0 {
+            f9_print_result("ERROR: entry engines have no thrust").
+            RETURN FALSE.
+        }
     }
     IF NOT f9_initialize_ltr(params) {
         RETURN FALSE.
@@ -44,16 +60,21 @@ FUNCTION f9_entry_burn {
     LOCAL steeringTarget IS "KILL".
     SAS OFF.
     LOCK STEERING TO steeringTarget.
-    LOCK THROTTLE TO 0.
     RCS ON.
 
     UNTIL (SHIP:VERTICALSPEED < 0
         AND SHIP:ALTITUDE <= params["entryBurnAlt"]) {
         IF SHIP:verticalspeed >= 0 {
-            SET steeringTarget TO f9_get_aero_steering(lookDirUp(vxcl(up:forevector, srfPrograde:forevector), srfPrograde:upvector)).
+            SET steeringTarget TO f9_get_aero_steering(
+                lookDirUp(
+                    vxcl(up:forevector, srfPrograde:forevector),
+                    srfPrograde:upvector
+                ),
+                vecNormal
+            ).
         }
         ELSE {
-            SET steeringTarget TO f9_get_aero_steering(srfPrograde).
+            SET steeringTarget TO f9_get_aero_steering(srfPrograde, vecNormal).
         }
         f9_print_recovery_vehicle().
         f9_print_at(
@@ -165,7 +186,7 @@ FUNCTION f9_entry_burn {
     }
 
     f9_print_at(11, "Phase: entry - powered guidance").
-    activate_engines(entryEngines).
+    f9_engine_activate(params, entryEngines).
     LOCK throttle to params["entryThrottle"].
     LOCAL predictionFailed IS FALSE.
     f9_print_at(16, "Engines: active").
@@ -217,7 +238,7 @@ FUNCTION f9_entry_burn {
     f9_print_at(11, "Phase: entry - cutoff").
     f9_print_at(16, "Engines: cutoff  Throttle: 0.00").
     LOCK THROTTLE TO 0.
-    deactivate_engines(entryEngines).
+    f9_engine_deactivate(params, entryEngines).
     UNLOCK THROTTLE.
     UNLOCK STEERING.
     IF predictionFailed {

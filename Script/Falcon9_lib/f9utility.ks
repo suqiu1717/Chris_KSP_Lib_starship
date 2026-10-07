@@ -131,6 +131,12 @@ FUNCTION f9_wait_for_recovery_start {
         f9_print_at(16, "Engines: waiting").
         WAIT 0.
     }
+    // Engine-mode handoff: the booster left the stack in the mode the ascent
+    // script selected. The switch belongs here so it also runs when the
+    // boostback phase is disabled. The delay is measured from this handoff.
+    IF NOT f9_engine_mode_post_separation(params) {
+        RETURN FALSE.
+    }
     WAIT params["boostBackDelay"].
     RETURN TRUE.
 }
@@ -492,6 +498,14 @@ FUNCTION f9_ltr_prediction_is_valid {
 
 // PEGLand-style steering: burnVector is the desired acceleration direction,
 // TiS is Engine:facing:inverse * Ship:facing, and targetRoll fixes roll.
+// The top vector is built as normal x fore, the same argument order
+// f9_lock_roll_zero uses, so the powered phases hold the aerodynamic roll zero.
+// The opposite order (fore x normal) is the same reference turned 180 degrees
+// about the fore axis, which the entry burn used to hand to the following
+// aerodynamic phase as a roll flip. The aerodynamic reference is the
+// anti-parallel wind direction, and f9_get_aero_steering turns it into the
+// vessel attitude with its own 180 degree pitch, so this order, not the
+// mirrored one, is what lands on the aerodynamic roll zero.
 FUNCTION f9_get_target_steering {
     PARAMETER burnVector.
     PARAMETER TiS.
@@ -502,18 +516,40 @@ FUNCTION f9_get_target_steering {
         RETURN SHIP:FACING.
     }
     LOCAL topVector IS V(0,0,0).
-    if (vecNormal <> 0)  SET topVector TO VCRS(burnVector, vecNormal).
-    ELSE SET topVector TO VCRS(burnVector, f9_get_surface_normal()).
+    if (vecNormal <> 0)  SET topVector TO VCRS(vecNormal, burnVector).
+    ELSE SET topVector TO VCRS(f9_get_surface_normal(), burnVector).
     IF topVector:MAG < 0.000001 {
         SET topVector TO NORTH:FOREVECTOR.
     }
     RETURN LOOKDIRUP(burnVector, topVector) * R(0, 0, targetRoll) * TiS.
 }
 
-// UEntry-style steering: Give desired plane-like direction then transform it into vessel direction
+// Lock the roll of a steering direction to the recovery roll-zero reference:
+// the ship top vector is built as orbit normal x fore, so the roll about the
+// fore axis is deterministic. Swapping the two VCRS arguments flips the roll
+// zero by 180 degrees.
+FUNCTION f9_lock_roll_zero {
+    PARAMETER direction.
+    PARAMETER vecNormal is 0.
+
+    IF vecNormal = 0 {
+        SET vecNormal TO f9_get_surface_normal().
+    }
+    LOCAL topVector IS VCRS(direction:FOREVECTOR, vecNormal).
+    IF topVector:MAG < 0.000001 {
+        SET topVector TO NORTH:FOREVECTOR.
+    }
+    RETURN LOOKDIRUP(direction:FOREVECTOR, topVector).
+}
+
+// UEntry-style steering: Give desired plane-like direction then transform it into vessel direction.
+// The roll is explicitly locked (see f9_lock_roll_zero) instead of inheriting
+// srfPrograde's implicit roll.
 FUNCTION f9_get_aero_steering {
     PARAMETER desiredDirection.
-    RETURN desiredDirection * ADDONS:LTR:rotation:INVERSE.
+    PARAMETER vecNormal is 0.
+
+    RETURN f9_lock_roll_zero(desiredDirection, vecNormal) * ADDONS:LTR:rotation:INVERSE.
 }
 
 FUNCTION f9_get_boostback_error {
@@ -553,8 +589,8 @@ FUNCTION f9_step_entry_vgo {
         SET vecVGO TO (entrySpeed - vecV:mag) * vecV:normalized.
     }
     ELSE {
-        SET VGO TO -xx - sqrt(xx^2 - (vecV:mag^2 - entrySpeed^2)).
-        SET vecVGO TO VGO * unitVGO.
+        LOCAL vgo IS -xx - sqrt(xx^2 - (vecV:mag^2 - entrySpeed^2)).
+        SET vecVGO TO vgo * unitVGO.
     }
     // 2. evaluate reaching time
     LOCAL upAxis TO vecRT:normalized.
@@ -614,6 +650,454 @@ FUNCTION f9_continuous_throttle {
     RETURN MAX(minCommand, MIN(1, simple_get_throttle(requestedFraction, minThrottle))).
 }
 
+// ---------------------------------------------------------------------------
+// SEP engine-mode control. Only active when the optional "engineModeControl"
+// key is TRUE, so every other vehicle keeps the tag + activate/shutdown path.
+//
+// The StarshipExpansionProject booster cluster carries one
+// ModuleSEPEngineSwitch and four ModuleEnginesFX on a single part, so engine
+// tags cannot split it into groups and kOS sees the four modules as one
+// aggregated engine. The switch owns ignition and shutdown: selecting a mode
+// lights the selected engine group and shuts the other groups down. Values
+// kOS cannot read back (mode table, group thrust) live in the boot lexicon;
+// use sepmodeprobe.ks to calibrate them.
+GLOBAL F9_ENGINE_MODE_INDEX IS -1.
+
+FUNCTION f9_engine_mode_enabled {
+    PARAMETER params.
+
+    IF params:HASKEY("engineModeControl") {
+        IF params["engineModeControl"] {
+            RETURN TRUE.
+        }
+    }
+    RETURN FALSE.
+}
+
+FUNCTION f9_engine_mode_module {
+    PARAMETER params.
+
+    LOCAL moduleName IS "ModuleSEPEngineSwitch".
+    IF params:HASKEY("engineModeModuleName") {
+        SET moduleName TO params["engineModeModuleName"].
+    }
+    LOCAL modules IS SHIP:MODULESNAMED(moduleName).
+    IF modules:LENGTH = 0 {
+        RETURN 0.
+    }
+    RETURN modules[0].
+}
+
+// Read the live mode index, or -1 when the game does not expose it.
+FUNCTION f9_engine_mode_read {
+    PARAMETER params.
+
+    LOCAL modeModule IS f9_engine_mode_module(params).
+    IF modeModule = 0 {
+        RETURN -1.
+    }
+    IF NOT params:HASKEY("engineModeNames") {
+        RETURN -1.
+    }
+    // kOS addresses fields by the name shown in the GUI, so the method name
+    // and the localized label are both worth trying.
+    LOCAL display IS "".
+    FOR fieldName IN LIST("currentEngineDisplay", "Mode") {
+        IF display = "" {
+            IF modeModule:HASFIELD(fieldName) {
+                SET display TO modeModule:GETFIELD(fieldName) + "".
+            }
+        }
+    }
+    IF display = "" {
+        RETURN -1.
+    }
+    LOCAL names IS params["engineModeNames"].
+    FROM {
+        LOCAL i IS 0.
+    } UNTIL i >= names:LENGTH STEP {
+        SET i TO i + 1.
+    } DO {
+        IF names[i] = display {
+            RETURN i.
+        }
+    }
+    RETURN -1.
+}
+
+FUNCTION f9_engine_mode_begin {
+    PARAMETER params.
+
+    IF F9_ENGINE_MODE_INDEX >= 0 {
+        RETURN TRUE.
+    }
+    LOCAL modeModule IS f9_engine_mode_module(params).
+    IF modeModule = 0 {
+        f9_print_result("ERROR: SEP engine-mode module was not found").
+        RETURN FALSE.
+    }
+    // Verify on the pad, not at MECO: a name that kOS cannot invoke is the
+    // usual reason a mode switch never happens.
+    IF NOT f9_engine_mode_step_available(params, TRUE)
+        OR NOT f9_engine_mode_step_available(params, FALSE) {
+        f9_engine_mode_report_unavailable(modeModule).
+        RETURN FALSE.
+    }
+    LOCAL index IS f9_engine_mode_read(params).
+    IF index < 0 {
+        IF NOT params:HASKEY("engineModeInitial") {
+            RETURN FALSE.
+        }
+        SET index TO ROUND(params["engineModeInitial"]).
+    }
+    SET F9_ENGINE_MODE_INDEX TO index.
+    RETURN TRUE.
+}
+
+FUNCTION f9_engine_mode_name {
+    PARAMETER params.
+
+    IF F9_ENGINE_MODE_INDEX < 0 {
+        RETURN "unknown".
+    }
+    IF params:HASKEY("engineModeNames") {
+        LOCAL names IS params["engineModeNames"].
+        IF F9_ENGINE_MODE_INDEX < names:LENGTH {
+            RETURN names[F9_ENGINE_MODE_INDEX].
+        }
+    }
+    RETURN "index " + F9_ENGINE_MODE_INDEX.
+}
+
+// Names that may step the switch, best first. kOS matches the name shown in
+// the action-group editor, which for this mod is the text behind
+// "#LOC_SEP_NextEngineMode" / "#LOC_SEP_PreviousEngineMode"; the method names
+// KSP stores in the craft file (NextEngineModeAction / PreviousEngineModeAction,
+// see the saved craft's ACTIONS block) are listed as well, so an install that
+// matches those still works. The boot value is tried first, so a rename only
+// needs a boot edit. The localization tag itself is listed last, for a kOS
+// build that compares the raw KSPAction string instead of its localized label.
+FUNCTION f9_engine_mode_step_names {
+    PARAMETER params.
+    PARAMETER forward.
+
+    LOCAL names IS LIST().
+    IF forward AND params:HASKEY("engineModeNextAction") {
+        names:ADD(params["engineModeNextAction"]).
+    }
+    IF (NOT forward) AND params:HASKEY("engineModePreviousAction") {
+        names:ADD(params["engineModePreviousAction"]).
+    }
+    IF forward {
+        names:ADD("Next Engine Mode").
+        names:ADD("NextEngineModeAction").
+        names:ADD("#LOC_SEP_NextEngineMode").
+    } ELSE {
+        names:ADD("Previous Engine Mode").
+        names:ADD("PreviousEngineModeAction").
+        names:ADD("#LOC_SEP_PreviousEngineMode").
+    }
+    RETURN names.
+}
+
+// Whether a name this install accepts can be invoked at all, using the same
+// resolution order as f9_engine_mode_step. The listed-name scans require the
+// matching HASACTION/HASEVENT flag, so this predicate stays exactly as strict
+// as what f9_engine_mode_step will actually do.
+FUNCTION f9_engine_mode_step_available {
+    PARAMETER params.
+    PARAMETER forward.
+
+    LOCAL modeModule IS f9_engine_mode_module(params).
+    IF modeModule = 0 {
+        RETURN FALSE.
+    }
+    LOCAL direction IS "Previous".
+    IF forward {
+        SET direction TO "Next".
+    }
+    FOR name IN f9_engine_mode_step_names(params, forward) {
+        IF modeModule:HASACTION(name) OR modeModule:HASEVENT(name) {
+            RETURN TRUE.
+        }
+    }
+    FOR entry IN modeModule:ALLACTIONNAMES {
+        IF entry:CONTAINS(direction) AND modeModule:HASACTION(entry) {
+            RETURN TRUE.
+        }
+    }
+    FOR entry IN modeModule:ALLEVENTNAMES {
+        IF entry:CONTAINS(direction) AND modeModule:HASEVENT(entry) {
+            RETURN TRUE.
+        }
+    }
+    RETURN FALSE.
+}
+
+FUNCTION f9_engine_mode_step {
+    PARAMETER params.
+    PARAMETER forward.
+
+    LOCAL modeModule IS f9_engine_mode_module(params).
+    IF modeModule = 0 {
+        RETURN FALSE.
+    }
+    LOCAL names IS f9_engine_mode_step_names(params, forward).
+    FOR actionName IN names {
+        IF modeModule:HASACTION(actionName) {
+            modeModule:DOACTION(actionName, TRUE).
+            WAIT 0.
+            RETURN TRUE.
+        }
+    }
+    // A career save can withhold actions until the action groups are unlocked;
+    // the right-click event runs the same code and stays available.
+    FOR eventName IN names {
+        IF modeModule:HASEVENT(eventName) {
+            modeModule:DOEVENT(eventName).
+            WAIT 0.
+            RETURN TRUE.
+        }
+    }
+    // Renamed entries: fall back to whatever listed name carries the direction.
+    // Only entries the matcher accepts are invoked, so a listed name that
+    // HASACTION/HASEVENT rejects cannot turn into a DOACTION/DOEVENT exception
+    // that kills the flight script.
+    LOCAL direction IS "Previous".
+    IF forward {
+        SET direction TO "Next".
+    }
+    FOR entry IN modeModule:ALLACTIONNAMES {
+        IF entry:CONTAINS(direction) AND modeModule:HASACTION(entry) {
+            modeModule:DOACTION(entry, TRUE).
+            WAIT 0.
+            RETURN TRUE.
+        }
+    }
+    FOR entry IN modeModule:ALLEVENTNAMES {
+        IF entry:CONTAINS(direction) AND modeModule:HASEVENT(entry) {
+            modeModule:DOEVENT(entry).
+            WAIT 0.
+            RETURN TRUE.
+        }
+    }
+    f9_engine_mode_report_unavailable(modeModule).
+    RETURN FALSE.
+}
+
+// Failure diagnostics: the names this install does offer, together with the
+// flag the matcher returns for each one. A name flagged True can be pasted
+// into engineModeNextAction / engineModePreviousAction; a name that is listed
+// but flagged False means the listed names and the matcher disagree, which is
+// the case the boot override exists for. Printed as scrolling text rather than
+// into the 48-character result row, which would truncate the list away.
+FUNCTION f9_engine_mode_report_unavailable {
+    PARAMETER modeModule.
+
+    f9_print_result("ERROR: no usable engine-mode step name").
+    PRINT "Engine mode names on " + modeModule:NAME + ":".
+    FOR actionName IN modeModule:ALLACTIONNAMES {
+        PRINT "  action [" + actionName + "] accepted="
+            + modeModule:HASACTION(actionName).
+    }
+    FOR eventName IN modeModule:ALLEVENTNAMES {
+        PRINT "  event [" + eventName + "] accepted="
+            + modeModule:HASEVENT(eventName).
+    }
+}
+
+// Step the switch to the target index, taking the shorter way around the
+// cyclic mode list. When the game exposes the current mode the tracker is
+// re-synchronized first, so a manual mode change does not desync the script.
+FUNCTION f9_engine_mode_goto {
+    PARAMETER params.
+    PARAMETER target.
+
+    IF NOT f9_engine_mode_enabled(params) {
+        RETURN TRUE.
+    }
+    IF NOT f9_engine_mode_begin(params) {
+        RETURN FALSE.
+    }
+    LOCAL count IS 4.
+    IF params:HASKEY("engineModeCount") {
+        SET count TO ROUND(params["engineModeCount"]).
+    }
+    // A cyclic table with fewer than one entry would make the step counts
+    // meaningless, and an index outside the table cannot be reached.
+    IF count < 1 {
+        f9_print_result("ERROR: engineModeCount must be at least 1").
+        RETURN FALSE.
+    }
+    LOCAL targetIndex IS ROUND(target).
+    IF targetIndex < 0 OR targetIndex >= count {
+        f9_print_result(
+            "ERROR: engine mode index " + targetIndex + " is out of range"
+        ).
+        RETURN FALSE.
+    }
+    LOCAL current IS f9_engine_mode_read(params).
+    IF current < 0 OR current >= count {
+        SET current TO F9_ENGINE_MODE_INDEX.
+    }
+    // Fail rather than step blindly: the caller keeps the thrust data of the
+    // group that is actually lit and retries on the next pass.
+    IF current < 0 OR current >= count {
+        f9_print_result("ERROR: current engine mode index is unknown").
+        RETURN FALSE.
+    }
+    IF current = targetIndex {
+        SET F9_ENGINE_MODE_INDEX TO current.
+        RETURN TRUE.
+    }
+
+    LOCAL forwardSteps IS targetIndex - current.
+    IF forwardSteps < 0 {
+        SET forwardSteps TO forwardSteps + count.
+    }
+    LOCAL backwardSteps IS count - forwardSteps.
+    IF forwardSteps <= backwardSteps {
+        FROM {
+            LOCAL i IS 0.
+        } UNTIL i >= forwardSteps STEP {
+            SET i TO i + 1.
+        } DO {
+            IF NOT f9_engine_mode_step(params, TRUE) {
+                RETURN FALSE.
+            }
+        }
+    } ELSE {
+        FROM {
+            LOCAL i IS 0.
+        } UNTIL i >= backwardSteps STEP {
+            SET i TO i + 1.
+        } DO {
+            IF NOT f9_engine_mode_step(params, FALSE) {
+                RETURN FALSE.
+            }
+        }
+    }
+    SET F9_ENGINE_MODE_INDEX TO targetIndex.
+    RETURN TRUE.
+}
+
+// Thrust data of one engine-mode group. kOS aggregates the four modules on the
+// cluster part, so the numbers come from the boot lexicon; only the thrust axis
+// is measured live from the tagged engines.
+FUNCTION f9_engine_mode_engine_data {
+    PARAMETER params.
+    PARAMETER dataKey.
+
+    LOCAL data IS params[dataKey].
+    LOCAL result IS LEXICON(
+        "thrust", data["thrust"],
+        "minthrottle", data["minthrottle"],
+        "spooluptime", data["spooluptime"],
+        "TiS", R(180, 0, 0)
+    ).
+    LOCAL engines IS LIST().
+    IF params:HASKEY("engineModeEngineTag") {
+        SET engines TO search_engine(params["engineModeEngineTag"]).
+    }
+    IF engines:LENGTH = 0 {
+        LIST ENGINES IN engines.
+    }
+    IF engines:LENGTH > 0 {
+        LOCAL info IS get_engines_info(engines).
+        IF info["thrust"] > 0 {
+            SET result["TiS"] TO info["TiS"].
+        }
+    }
+    RETURN result.
+}
+
+// Select the post-separation engine group (Middle Eight). The boostback phase
+// calls this at the moment its flip reaches burnAlignTolerance, so the burn
+// lights up on the full boostback group.
+FUNCTION f9_engine_mode_select_post_separation {
+    PARAMETER params.
+
+    IF NOT f9_engine_mode_enabled(params) {
+        RETURN TRUE.
+    }
+    IF NOT f9_engine_mode_goto(params, params["engineModePostSeparation"]) {
+        f9_print_result("ERROR: engine-mode post-separation switch failed").
+        RETURN FALSE.
+    }
+    f9_print_at(16, "Engine mode: " + f9_engine_mode_name(params)).
+    RETURN TRUE.
+}
+
+// Separation handoff. With boostback enabled the switch belongs to the
+// boostback phase, which knows when the booster is aligned; that phase holds the
+// inherited hot-staging throttle through the predictions and the flip and cuts
+// the burn when its guidance ends. Without boostback there is no alignment to
+// wait for, so cut the burn here and fall back to a fixed delay after
+// separation.
+FUNCTION f9_engine_mode_post_separation {
+    PARAMETER params.
+
+    IF NOT f9_engine_mode_enabled(params) {
+        RETURN TRUE.
+    }
+    IF NOT f9_engine_mode_begin(params) {
+        // begin() already reported the specific reason.
+        RETURN FALSE.
+    }
+    IF params:HASKEY("enableBoostBack") AND params["enableBoostBack"] {
+        RETURN TRUE.
+    }
+    // Nothing takes the inherited throttle over on this path, and the mode
+    // switch below must not light the post-separation group under thrust, so
+    // cut the burn at the handoff: the boostback-disabled profile (the ASDS
+    // survey configuration) then coasts from separation on with the engines
+    // lit at throttle 0.
+    LOCK THROTTLE TO 0.
+    WAIT params["engineModeSeparationDelay"].
+    RETURN f9_engine_mode_select_post_separation(params).
+}
+
+// Gated wrappers: under engine-mode control the SEP switch owns ignition and
+// shutdown, so the legacy calls become no-ops for this vehicle only.
+FUNCTION f9_engine_activate {
+    PARAMETER params.
+    PARAMETER engines.
+
+    IF f9_engine_mode_enabled(params) {
+        RETURN TRUE.
+    }
+    activate_engines(engines).
+    RETURN TRUE.
+}
+
+FUNCTION f9_engine_deactivate {
+    PARAMETER params.
+    PARAMETER engines.
+
+    IF f9_engine_mode_enabled(params) {
+        RETURN TRUE.
+    }
+    deactivate_engines(engines).
+    RETURN TRUE.
+}
+
+// Mode indices address the configured cyclic table; an index outside it would
+// make the shortest-path step count in f9_engine_mode_goto meaningless. Only
+// call this for a key that f9_validate_required_keys already found.
+FUNCTION f9_engine_mode_index_valid {
+    PARAMETER params.
+    PARAMETER indexKey.
+
+    LOCAL count IS ROUND(params["engineModeCount"]).
+    LOCAL index IS ROUND(params[indexKey]).
+    IF index < 0 OR index >= count {
+        PRINT "F9 config error: " + indexKey + " must be inside 0.."
+            + (count - 1) + " (engineModeCount)".
+        RETURN FALSE.
+    }
+    RETURN TRUE.
+}
+
 FUNCTION f9_validate_required_keys {
     PARAMETER params.
     PARAMETER requiredKeys.
@@ -656,6 +1140,30 @@ FUNCTION f9_validate_launch_params {
         PRINT "F9 config error: turnSpeed and pitchOmega must be positive".
         SET ok TO FALSE.
     }
+    IF f9_engine_mode_enabled(params) {
+        IF NOT f9_validate_required_keys(
+            params,
+            LIST(
+                "engineModeInitial", "engineModePreSeparation",
+                "engineModePreSeparationMass", "engineModeCount"
+            ),
+            "launch engine mode"
+        ) {
+            SET ok TO FALSE.
+        } ELSE {
+            IF params["engineModePreSeparationMass"] < 0 {
+                PRINT "F9 config error: engineModePreSeparationMass must not be negative".
+                SET ok TO FALSE.
+            }
+            FOR modeIndexKey IN LIST(
+                "engineModeInitial", "engineModePreSeparation"
+            ) {
+                IF NOT f9_engine_mode_index_valid(params, modeIndexKey) {
+                    SET ok TO FALSE.
+                }
+            }
+        }
+    }
     RETURN ok.
 }
 
@@ -666,8 +1174,9 @@ FUNCTION f9_validate_recovery_params {
         "kOSIPU", "boostbackEngineTag", "entryEngineTag",
         "landingDecEngineTag", "landingEngineTag", "boostBackMass",
         "landingSiteUse", "enableBoostBack", "enableEntryBurn",
-        "targetRoll", "altitudeOffset", "boostBackDelay", "entryBurnAlt",
-        "entryVSpeed", "burnAlignTolerance", "ltrCtrlSpeedSamples",
+        "targetRoll", "altitudeOffset", "boostBackDelay", "boostBackThrottle",
+        "entryBurnAlt", "entryVSpeed", "entryThrottle",
+        "burnAlignTolerance", "ltrCtrlSpeedSamples",
         "ltrCtrlAOASamples",
         "ltrAeroSpeedSamples", "ltrAeroAltitudeSamples", "ltrCdFactor",
         "ltrClFactor", "ltrPredictMinStep", "ltrPredictMaxStep",
@@ -753,6 +1262,48 @@ FUNCTION f9_validate_recovery_params {
     IF (params["touchDownSpeed"] < 0) {
         PRINT "F9 config error: invalid landing speed".
         SET ok TO FALSE.
+    }
+    IF f9_engine_mode_enabled(params) {
+        IF NOT f9_validate_required_keys(
+            params,
+            LIST(
+                "engineModeInitial", "engineModePostSeparation",
+                "engineModeSeparationDelay", "engineModeTerminal",
+                "engineModeTerminalAirspeed", "engineModeCount",
+                "engineModeDataPostSeparation", "engineModeDataTerminal"
+            ),
+            "recovery engine mode"
+        ) {
+            SET ok TO FALSE.
+        } ELSE {
+            IF params["engineModeSeparationDelay"] < 0 {
+                PRINT "F9 config error: engineModeSeparationDelay must not be negative".
+                SET ok TO FALSE.
+            }
+            IF params["engineModeTerminalAirspeed"] <= 0 {
+                PRINT "F9 config error: engineModeTerminalAirspeed must be positive".
+                SET ok TO FALSE.
+            }
+            FOR modeIndexKey IN LIST(
+                "engineModeInitial", "engineModePostSeparation",
+                "engineModeTerminal"
+            ) {
+                IF NOT f9_engine_mode_index_valid(params, modeIndexKey) {
+                    SET ok TO FALSE.
+                }
+            }
+            FOR dataKey IN LIST("engineModeDataPostSeparation", "engineModeDataTerminal") {
+                LOCAL data IS params[dataKey].
+                IF NOT (data:HASKEY("thrust") AND data:HASKEY("minthrottle")
+                    AND data:HASKEY("spooluptime")) {
+                    PRINT "F9 config error: " + dataKey + " needs thrust, minthrottle and spooluptime".
+                    SET ok TO FALSE.
+                } ELSE IF data["thrust"] <= 0 {
+                    PRINT "F9 config error: " + dataKey + " thrust must be positive".
+                    SET ok TO FALSE.
+                }
+            }
+        }
     }
     RETURN ok.
 }

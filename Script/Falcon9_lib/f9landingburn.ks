@@ -87,30 +87,56 @@ FUNCTION f9_landing_burn {
 
     f9_clear_guidance_display().
     pre_landingburn_hook().
-    LOCAL landingEngines IS search_engine(params["landingEngineTag"]).
-    IF landingEngines:LENGTH = 0 {
-        f9_print_result("ERROR: no landing engines found").
-        RETURN FALSE.
-    }
-    LOCAL decEngines IS search_engine(params["landingDecEngineTag"]).
-    IF decEngines:LENGTH = 0 {
-        SET decEngines TO landingEngines.
-    }
+    LOCAL engineModeControl IS f9_engine_mode_enabled(params).
+    LOCAL landingEngines IS LIST().
+    LOCAL decEngines IS LIST().
     LOCAL shutDownEngines IS LIST().
-    for _eng in decEngines {
-        IF NOT _eng:tag:contains(params["landingEngineTag"]) {
-            shutDownEngines:add(_eng).
+    LOCAL maxThrust1 IS 0.
+    LOCAL minThrottle1 IS 0.
+    LOCAL spoolUpTime1 IS 0.
+    LOCAL TiS1 IS R(180, 0, 0).
+    LOCAL maxThrust2 IS 0.
+    LOCAL minThrottle2 IS 0.
+    LOCAL TiS2 IS R(180, 0, 0).
+    IF engineModeControl {
+        // The SEP switch owns both groups: the post-separation group
+        // decelerates and the terminal group takes over below
+        // engineModeTerminalAirspeed. Group thrust comes from the boot
+        // lexicon because kOS aggregates the four modules on the cluster part.
+        LOCAL phase1Data IS f9_engine_mode_engine_data(params, "engineModeDataPostSeparation").
+        SET maxThrust1 TO phase1Data["thrust"].
+        SET minThrottle1 TO phase1Data["minthrottle"].
+        SET spoolUpTime1 TO phase1Data["spooluptime"].
+        SET TiS1 TO phase1Data["TiS"].
+        LOCAL phase2Data IS f9_engine_mode_engine_data(params, "engineModeDataTerminal").
+        SET maxThrust2 TO phase2Data["thrust"].
+        SET minThrottle2 TO phase2Data["minthrottle"].
+        SET TiS2 TO phase2Data["TiS"].
+    } ELSE {
+        SET landingEngines TO search_engine(params["landingEngineTag"]).
+        IF landingEngines:LENGTH = 0 {
+            f9_print_result("ERROR: no landing engines found").
+            RETURN FALSE.
         }
+        SET decEngines TO search_engine(params["landingDecEngineTag"]).
+        IF decEngines:LENGTH = 0 {
+            SET decEngines TO landingEngines.
+        }
+        for _eng in decEngines {
+            IF NOT _eng:tag:contains(params["landingEngineTag"]) {
+                shutDownEngines:add(_eng).
+            }
+        }
+        LOCAL engineInfo1 IS get_engines_info(decEngines).
+        SET maxThrust1 TO engineInfo1["thrust"].
+        SET minThrottle1 TO engineInfo1["minthrottle"].
+        SET spoolUpTime1 TO engineInfo1["spooluptime"].
+        SET TiS1 TO engineInfo1["TiS"].
+        LOCAL engineInfo2 IS get_engines_info(landingEngines).
+        SET maxThrust2 TO engineInfo2["thrust"].
+        SET minThrottle2 TO engineInfo2["minthrottle"].
+        SET TiS2 TO engineInfo2["TiS"].
     }
-    LOCAL engineInfo1 IS get_engines_info(decEngines).
-    LOCAL maxThrust1 IS engineInfo1["thrust"].
-    LOCAL minThrottle1 IS engineInfo1["minthrottle"].
-    LOCAL spoolUpTime1 IS engineInfo1["spooluptime"].
-    LOCAL TiS1 IS engineInfo1["TiS"].
-    LOCAL engineInfo2 IS get_engines_info(landingEngines).
-    LOCAL maxThrust2 IS engineInfo2["thrust"].
-    LOCAL minThrottle2 IS engineInfo2["minthrottle"].
-    LOCAL TiS2 IS engineInfo2["TiS"].
     IF maxThrust1 <= 0 OR maxThrust2 <= 0 {
         f9_print_result("ERROR: landing engines have no thrust").
         RETURN FALSE.
@@ -139,7 +165,7 @@ FUNCTION f9_landing_burn {
     ).
     LOCAL bottomHeight IS f9_get_bottom_height(TiS2).
     LOCAL nextBoundsUpdate IS TIME:SECONDS + params["boundsUpdatePeriod"].
-    LOCAL steeringTarget IS f9_get_aero_steering(srfPrograde).
+    LOCAL steeringTarget IS f9_get_aero_steering(srfPrograde, vecNormal).
     SAS OFF.
     LOCK STEERING TO steeringTarget.
     LOCK THROTTLE TO 0.
@@ -171,7 +197,7 @@ FUNCTION f9_landing_burn {
         LOCAL radius IS (-SHIP:BODY:POSITION):MAG.
         LOCAL g IS SHIP:BODY:MU / radius^2.
 
-        LOCAL spoolTime IS engineInfo1["spooluptime"].
+        LOCAL spoolTime IS spoolUpTime1.
         LOCAL futureHeight IS bottomAltitude
             + SHIP:VERTICALSPEED * spoolTime
             - 0.5 * g * spoolTime^2.
@@ -190,9 +216,15 @@ FUNCTION f9_landing_burn {
         ).
         IF (futureHeight <= params["landingBurnAltitude"] AND (NOT _engineLitFlag)) {
             f9_print_at(16, "Ignition condition: met").
-            activate_engines(decEngines).
+            // Under engine-mode control the engines are already lit (the mode
+            // switch owns ignition), so the powered phase starts immediately
+            // instead of waiting for a spool-up.
+            f9_engine_activate(params, decEngines).
             SET _engineLitFlag TO TRUE.
             SET _engineLitTime TO time:seconds.
+            IF engineModeControl {
+                BREAK.
+            }
         }
         IF (_engineLitFlag AND time:seconds >= _engineLitTime + spoolUpTime1) {
             BREAK.
@@ -247,7 +279,7 @@ FUNCTION f9_landing_burn {
             f9_print_at(14, "Aero command: surface retrograde").
         }
         f9_print_at(16, "Ignition: armed  Engines: inactive").
-        SET steeringTarget TO f9_get_aero_steering(desiredDirection).
+        SET steeringTarget TO f9_get_aero_steering(desiredDirection, vecNormal).
         WAIT 0.
     }
 
@@ -273,7 +305,7 @@ FUNCTION f9_landing_burn {
     if (refAccStart <= 0) {
         f9_print_result("ERROR: invalid phase-1 acceleration").
         LOCK THROTTLE TO 0.
-        deactivate_engines(decEngines).
+        f9_engine_deactivate(params, decEngines).
         UNLOCK THROTTLE.
         UNLOCK STEERING.
         RETURN FALSE.
@@ -311,6 +343,12 @@ FUNCTION f9_landing_burn {
             params["targetRoll"],
             vecNormal
         ).
+        // Keep the roll locked to the recovery zero reference (the same lock
+        // used by the aerodynamic phase) during the powered descent. With
+        // targetRoll = 0 the steering above already builds that zero, so this
+        // is a guard rather than a correction: it pins the roll (overriding
+        // targetRoll on this phase) and leaves the thrust axis untouched.
+        SET steeringTarget TO f9_lock_roll_zero(steeringTarget, vecNormal).
         return true.
     }
 
@@ -370,26 +408,46 @@ FUNCTION f9_landing_burn {
         ELSE SET accTarget TO quadraticControl["cmdA"].
         // set _drawAcc to vecDraw(V(0,0,0), accelerationShip * 5, RGB(0, 255, 0), "Acc", 1, true).
 
-        // Shutdown decelerate engines logic: Sample N points in the trajectory to test if they are all lower than thrust cutoff
+        // Engine transition. Under engine-mode control the terminal group takes
+        // over below engineModeTerminalAirspeed; the legacy path samples the
+        // remaining trajectory and switches the tag-selected groups instead.
         if (NOT hasShutdown) {
-            LOCAL thrustCutoff IS maxThrust2 * (0.85 + 0.15*minThrottle2).
-            LOCAL timeSeq IS LIST().
-            mlinspace(quadraticControl["qT"], 0, 5, timeSeq).
-            LOCAL shutdownFlag TO TRUE.
-            for _qT in timeSeq {
-                LOCAL cmdThrust TO (targetAcceleration + quadraticControl["qJ"]*_qT + 0.5*quadraticControl["qS"]*_qT^2 + upAxis*g):mag * ship:mass.
-                if (cmdThrust > thrustCutoff) {
-                    SET shutdownFlag TO FALSE.
-                    BREAK.
+            IF engineModeControl {
+                IF ship:airspeed < params["engineModeTerminalAirspeed"] {
+                    // Adopt the terminal group data only once the switch has
+                    // taken effect. On failure the guidance keeps the data of
+                    // the group that is still lit and retries next pass,
+                    // instead of commanding Center Three thrust with Middle
+                    // Eight burning.
+                    IF f9_engine_mode_goto(params, params["engineModeTerminal"]) {
+                        SET TiS TO TiS2.
+                        SET _maxThrust TO maxThrust2.
+                        SET minThrottle TO minThrottle2.
+                        SET hasShutdown TO TRUE.
+                    } ELSE {
+                        f9_print_result("ERROR: engine-mode terminal switch failed").
+                    }
                 }
-            }
-            if (shutdownFlag) {
-                deactivate_engines(shutDownEngines).
-                activate_engines(landingEngines).
-                SET TiS TO TiS2.
-                SET _maxThrust TO maxThrust2.
-                SET minThrottle TO minThrottle2.
-                SET hasShutdown TO TRUE.
+            } ELSE {
+                LOCAL thrustCutoff IS maxThrust2 * (0.85 + 0.15*minThrottle2).
+                LOCAL timeSeq IS LIST().
+                mlinspace(quadraticControl["qT"], 0, 5, timeSeq).
+                LOCAL shutdownFlag TO TRUE.
+                for _qT in timeSeq {
+                    LOCAL cmdThrust TO (targetAcceleration + quadraticControl["qJ"]*_qT + 0.5*quadraticControl["qS"]*_qT^2 + upAxis*g):mag * ship:mass.
+                    if (cmdThrust > thrustCutoff) {
+                        SET shutdownFlag TO FALSE.
+                        BREAK.
+                    }
+                }
+                if (shutdownFlag) {
+                    deactivate_engines(shutDownEngines).
+                    activate_engines(landingEngines).
+                    SET TiS TO TiS2.
+                    SET _maxThrust TO maxThrust2.
+                    SET minThrottle TO minThrottle2.
+                    SET hasShutdown TO TRUE.
+                }
             }
         }
 
@@ -417,13 +475,18 @@ FUNCTION f9_landing_burn {
             "Local vertical speed: "
                 + ROUND(ship:verticalspeed, 2) + " m/s"
         ).
+        IF engineModeControl {
+            f9_print_at(18, "Engine mode: " + f9_engine_mode_name(params)).
+        }
         WAIT 0.
     }
 
     f9_print_at(11, "Phase: landing - cutoff").
     f9_print_at(16, "Engines: cutoff  Throttle: 0.00").
-    deactivate_engines(decEngines).
-    deactivate_engines(landingEngines).
+    // Under engine-mode control the cutoff only zeroes the throttle; the SEP
+    // switch keeps the selected group lit.
+    f9_engine_deactivate(params, decEngines).
+    f9_engine_deactivate(params, landingEngines).
     SET done TO TRUE.
     LOCK THROTTLE TO 0.
     LOCK steering TO lookDirUp(up:forevector, (ship:facing*TiS:inverse):topvector) * TiS.
